@@ -1,0 +1,11 @@
+[run]
+branch = true
+source = xts_utils
+
+[report]
+show_missing = true
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    if __name__ == .__main__.:
+    @abc.abstractmethod
