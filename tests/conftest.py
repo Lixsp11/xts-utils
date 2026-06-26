@@ -71,6 +71,39 @@ def _make_nsssh_private_key(comment: str = "test-key") -> str:
             "---- END NSSSH PRIVATE KEY ----\n")
 
 
+# Throwaway Ed25519 material (NOT a real keypair; only exercises the wrapping path).
+_ED_PUB = bytes(range(32))
+_ED_PRIV = _ED_PUB * 2  # 64 bytes = seed || public, as openssh stores it
+
+
+def _ed25519_pub_blob() -> bytes:
+    return _ssh_string(b"ssh-ed25519") + _ssh_string(_ED_PUB)
+
+
+def _make_nsssh_ed25519_key(comment: str = "ed-key") -> str:
+    """Build an unencrypted nsssh-key-v6 ssh-ed25519 key (public block has no '=')."""
+    section = struct.pack(">II", 0x0A0B0C0D, 0x0A0B0C0D)
+    section += _ssh_string(_ED_PRIV)
+    section += _ssh_string(comment.encode())
+    i = 1
+    while len(section) % 8 != 0:
+        section += bytes([i])
+        i += 1
+    priv = (b"nsssh-key-v6\x00"
+            + _ssh_string(b"none") + _ssh_string(b"none") + _ssh_string(b"")
+            + struct.pack(">I", 1) + _ssh_string(section))
+    blob = base64.b64encode(_ed25519_pub_blob()).decode() + base64.b64encode(priv).decode()
+
+    def wrap(b64: str) -> str:
+        return "\n".join(b64[i:i + 64] for i in range(0, len(b64), 64))
+
+    return ("---- BEGIN NSSSH PRIVATE KEY ----\n"
+            f"Comment: {comment}\n"
+            "Key: 2, ssh-ed25519\n"
+            f"{wrap(blob)}\n"
+            "---- END NSSSH PRIVATE KEY ----\n")
+
+
 def _make_host_key_pub() -> str:
     b64 = base64.b64encode(_rsa_pub_blob()).decode()
     body = "\n".join(b64[i:i + 70] for i in range(0, len(b64), 70))
@@ -121,6 +154,16 @@ def make_nsssh_key() -> Callable[[str], str]:
 @pytest.fixture
 def nsssh_key() -> str:
     return _make_nsssh_private_key()
+
+
+@pytest.fixture
+def nsssh_ed25519_key() -> str:
+    return _make_nsssh_ed25519_key()
+
+
+@pytest.fixture
+def ed25519_material() -> tuple[bytes, bytes]:
+    return _ED_PUB, _ED_PRIV
 
 
 @pytest.fixture

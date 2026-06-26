@@ -129,7 +129,8 @@ def _resolve_jump_alias(proxy: Proxy, backup: Backup, alias_map: AliasMap) -> st
 
 def render_session(session: Session, backup: Backup, alias_map: AliasMap, *,
                    key_dir: str = "~/.ssh/xts/keys",
-                   identities_only: bool = True) -> str:
+                   identities_only: bool = True,
+                   converted_keys: set[str] | None = None) -> str:
     """Render a single session as one Host block."""
     lines: list[str] = []
     alias = host_alias(session, alias_map)
@@ -148,6 +149,9 @@ def render_session(session: Session, backup: Backup, alias_map: AliasMap, *,
 
     if session.uses_pubkey and session.user_key:
         keypath = posixpath.join(key_dir, session.user_key)
+        if converted_keys is not None and session.user_key not in converted_keys:
+            lines.append(f"    # WARNING: key '{session.user_key}' could not be converted "
+                         "(unsupported/encrypted); this IdentityFile will not work until you replace it")
         lines.append(f"    IdentityFile {quote_path(keypath)}")
         if identities_only:
             lines.append("    IdentitiesOnly yes")
@@ -156,6 +160,9 @@ def render_session(session: Session, backup: Backup, alias_map: AliasMap, *,
     if proxy:
         for pl in _proxy_lines(session, proxy, backup, alias_map):
             lines.append(f"    {pl}")
+    elif session.proxy_name:
+        lines.append(f"    # Proxy '{session.proxy_name}' is not included in this backup; "
+                     "set ProxyJump/ProxyCommand manually")
 
     for f in session.forwards:
         fl = _forward_line(f)

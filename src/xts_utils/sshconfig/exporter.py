@@ -139,6 +139,12 @@ def export_backup(backup: Backup, output_dir: str = DEFAULT_HOME, *,
     cfg_key_dir = cfg_base + "/keys"
     written_keys, warnings = install_keys(backup, key_dir_fs)
 
+    converted = set(written_keys)
+    for s in backup.sessions:
+        if s.proxy_name and backup.proxy_for(s) is None:
+            warnings.append(f"session '{s.name}' references proxy '{s.proxy_name}', which is not "
+                            "in the backup; its proxy was omitted (set ProxyJump/ProxyCommand manually)")
+
     alias_map = build_alias_map(backup.sessions)
     conf_d = os.path.join(base_fs, "conf.d")
     max_depth = 1
@@ -147,7 +153,7 @@ def export_backup(backup: Backup, output_dir: str = DEFAULT_HOME, *,
         depth = (rel.count("/") + 2) if rel else 1
         max_depth = max(max_depth, depth)
         block = render_session(s, backup, alias_map, key_dir=cfg_key_dir,
-                               identities_only=identities_only)
+                               identities_only=identities_only, converted_keys=converted)
         _write(os.path.join(conf_d, rel, s.name + ".conf"), block)
 
     # Top-level config: multi-depth glob Includes to cover arbitrary nesting.

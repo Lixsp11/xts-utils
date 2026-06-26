@@ -1,29 +1,33 @@
 """Parse NetSarang's proprietary `NSSSH PRIVATE KEY` (nsssh-key-v6) format and
-convert it into a standard PKCS#1 PEM private key that OpenSSH can use directly.
+convert it into a private key OpenSSH can use directly: PKCS#1 PEM for RSA,
+``openssh-key-v1`` PEM for Ed25519.
 
 The file looks like:
 
     ---- BEGIN NSSSH PRIVATE KEY ----
     Comment: ...
     Key: 7, ssh-rsa
-    <base64 block 1: standard ssh-rsa public key blob>
+    <base64 block 1: standard ssh public key blob>
     <base64 block 2: nsssh-key-v6 private key container>
     ---- END NSSSH PRIVATE KEY ----
 
 There is no blank line between the two base64 blocks; they are concatenated.
-Block 1 ends with base64 padding (`=`), which is used to split them. Block 2's
-structure mirrors OpenSSH's openssh-key-v1:
+Each block is independently base64-padded to a 4-char boundary, so block 2 always
+begins at a multiple-of-4 offset -- we locate it by scanning those offsets for the
+one whose bytes start with the ``nsssh-key-v6`` magic (splitting on ``=`` padding
+fails for e.g. Ed25519, whose 51-byte public block needs no padding).
+
+Block 2 mirrors OpenSSH's openssh-key-v1, but its private section stores only the
+secret scalars (no key-type tag, no redundant public fields):
 
     magic        : "nsssh-key-v6\\0"   (13 bytes, NOT length-prefixed)
     cipher       : string  (only "none", i.e. unencrypted, is supported here)
     kdf          : string  ("none")
     kdfoptions   : string
     numkeys      : uint32
-    privsection  : string  ->  uint32 check x2 (equal) + p + q + d + iqmp + comment + padding
-
-Verified against a real sample: fields = [p, q, d, iqmp], satisfying p*q==n and
-(e*d) mod lcm(p-1,q-1) == 1. We compute iqmp ourselves via pow(q,-1,p) rather than
-trusting the stored value.
+    privsection  : string  ->  uint32 check x2 (equal) + <secret fields> + comment + padding
+        ssh-rsa     : fields = [p, q, d, iqmp]   (p*q == n; iqmp recomputed via pow(q,-1,p))
+        ssh-ed25519 : fields = [priv64]          (32-byte seed || 32-byte public key)
 """
 from __future__ import annotations
 
@@ -31,6 +35,8 @@ import base64
 import re
 import struct
 from dataclasses import dataclass
+
+_NSSSH_MAGIC = b"nsssh-key-v6"
 
 
 class KeyConversionError(Exception):
@@ -91,6 +97,10 @@ def _pem(label: str, der: bytes) -> str:
     return f"-----BEGIN {label}-----\n" + "\n".join(lines) + f"\n-----END {label}-----\n"
 
 
+def _ssh_string(b: bytes) -> bytes:
+    return struct.pack(">I", len(b)) + b
+
+
 def _read_str(buf: bytes, off: int) -> tuple[bytes, int]:
     (n,) = struct.unpack(">I", buf[off:off + 4])
     off += 4
@@ -98,7 +108,10 @@ def _read_str(buf: bytes, off: int) -> tuple[bytes, int]:
 
 
 def _split_blocks(text: str) -> tuple[bytes, bytes]:
-    """Extract and split the public/private base64 blocks from .pri text."""
+    """Extract and split the public/private base64 blocks from .pri text.
+
+    Returns (public-key blob, nsssh-key-v6 private container).
+    """
     body = []
     for line in text.splitlines():
         s = line.strip()
@@ -109,29 +122,26 @@ def _split_blocks(text: str) -> tuple[bytes, bytes]:
             continue
         body.append(s)
     blob = "".join(body)
-    m = re.search(r"=+", blob)
-    if not m:
-        raise KeyConversionError("Could not find public/private block boundary (no base64 padding)")
-    pub = base64.b64decode(blob[:m.end()])
-    priv = base64.b64decode(blob[m.end():])
-    return pub, priv
+    # Block 2 starts at a multiple-of-4 offset; find the one beginning with the magic.
+    for i in range(4, len(blob) + 1, 4):
+        try:
+            tail = base64.b64decode(blob[i:])
+        except (ValueError, base64.binascii.Error):  # type: ignore[attr-defined]
+            continue
+        if tail[:len(_NSSSH_MAGIC)] == _NSSSH_MAGIC:
+            try:
+                pub = base64.b64decode(blob[:i])
+            except (ValueError, base64.binascii.Error):  # type: ignore[attr-defined]
+                continue
+            return pub, tail
+    raise KeyConversionError("Could not locate the nsssh-key-v6 private block")
 
 
-def parse_nsssh_private_key(text: str) -> RSAKey:
-    """Parse NSSSH private key text into an RSAKey. Only unencrypted ssh-rsa is supported."""
-    pub, priv = _split_blocks(text)
-
-    ktype, o = _read_str(pub, 0)
-    if ktype != b"ssh-rsa":
-        raise KeyConversionError(f"Unsupported key type: {ktype!r} (only ssh-rsa is supported)")
-    e_b, o = _read_str(pub, o)
-    n_b, o = _read_str(pub, o)
-    e = int.from_bytes(e_b, "big")
-    n = int.from_bytes(n_b, "big")
-
-    if priv[:12] != b"nsssh-key-v6":
+def _private_section(priv: bytes) -> bytes:
+    """Validate the container header and return the (unencrypted) private section."""
+    if priv[:len(_NSSSH_MAGIC)] != _NSSSH_MAGIC:
         raise KeyConversionError(f"Unknown private key container magic: {priv[:12]!r}")
-    o = 13  # skip "nsssh-key-v6\0"
+    o = len(_NSSSH_MAGIC) + 1  # skip "nsssh-key-v6\0"
     cipher, o = _read_str(priv, o)
     kdf, o = _read_str(priv, o)
     _kdfopts, o = _read_str(priv, o)
@@ -141,10 +151,14 @@ def parse_nsssh_private_key(text: str) -> RSAKey:
             "decryption is not supported yet")
     o += 4  # numkeys
     section, _ = _read_str(priv, o)
-
     check1, check2 = struct.unpack(">II", section[:8])
     if check1 != check2:
         raise KeyConversionError("Private key check fields mismatch; file may be corrupted")
+    return section
+
+
+def _section_fields(section: bytes) -> list[bytes]:
+    """Read the length-prefixed secret fields after the 8-byte check header."""
     po = 8
     fields: list[bytes] = []
     while po + 4 <= len(section):
@@ -153,18 +167,35 @@ def parse_nsssh_private_key(text: str) -> RSAKey:
             break
         fields.append(section[po + 4:po + 4 + ln])
         po += 4 + ln
+    return fields
+
+
+def _decode_comment(raw: bytes) -> str:
+    try:
+        return raw.decode()
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
+
+
+def parse_nsssh_private_key(text: str) -> RSAKey:
+    """Parse an NSSSH **ssh-rsa** private key into an RSAKey. Unencrypted only."""
+    pub, priv = _split_blocks(text)
+
+    ktype, o = _read_str(pub, 0)
+    if ktype != b"ssh-rsa":
+        raise KeyConversionError(f"Unsupported key type: {ktype!r} (only ssh-rsa is supported here)")
+    e_b, o = _read_str(pub, o)
+    n_b, o = _read_str(pub, o)
+    e = int.from_bytes(e_b, "big")
+    n = int.from_bytes(n_b, "big")
+
+    fields = _section_fields(_private_section(priv))
     if len(fields) < 3:
         raise KeyConversionError("Not enough private key fields to reconstruct RSA parameters")
-
     p = int.from_bytes(fields[0], "big")
     q = int.from_bytes(fields[1], "big")
     d = int.from_bytes(fields[2], "big")
-    comment = ""
-    if len(fields) >= 5:
-        try:
-            comment = fields[4].decode()
-        except UnicodeDecodeError:
-            comment = fields[4].decode("latin-1")
+    comment = _decode_comment(fields[4]) if len(fields) >= 5 else ""
 
     if p * q != n:
         raise KeyConversionError("p*q != n; RSA parameter reconstruction failed")
@@ -172,7 +203,57 @@ def parse_nsssh_private_key(text: str) -> RSAKey:
     return RSAKey(n=n, e=e, d=d, p=p, q=q, comment=comment)
 
 
+def _openssh_key_v1_pem(pub_blob: bytes, priv_entry: bytes, comment: bytes) -> str:
+    """Wrap one unencrypted key into an ``openssh-key-v1`` PEM.
+
+    ``priv_entry`` is the per-key private body (key-type + public + private parts);
+    the check ints, comment and block padding are added here.
+    """
+    check = 0x6E737368  # "nssh" -- deterministic so output is reproducible
+    section = struct.pack(">II", check, check) + priv_entry + _ssh_string(comment)
+    pad = 1
+    while len(section) % 8 != 0:  # cipher "none" -> 8-byte block
+        section += bytes([pad & 0xFF])
+        pad += 1
+    body = (b"openssh-key-v1\0"
+            + _ssh_string(b"none")        # ciphername
+            + _ssh_string(b"none")        # kdfname
+            + _ssh_string(b"")            # kdfoptions
+            + struct.pack(">I", 1)        # numkeys
+            + _ssh_string(pub_blob)
+            + _ssh_string(section))
+    return _pem("OPENSSH PRIVATE KEY", body)
+
+
+def _generic_to_openssh(pub_blob: bytes, priv: bytes) -> tuple[str, str]:
+    """Convert any non-RSA NSSSH key to an openssh-key-v1 PEM.
+
+    For ed25519/ecdsa/dss the openssh private entry is simply the public blob
+    followed by the secret scalar(s); the public parameters are already carried
+    by ``pub_blob``. nsssh stores those secrets (then the comment) in the same
+    order, so wrapping is uniform. Verified against ssh-ed25519; ecdsa/dss follow
+    the same openssh-key-v1 layout but are best-effort (no sample to validate).
+    """
+    fields = _section_fields(_private_section(priv))
+    if not fields:
+        raise KeyConversionError("No private fields found in the key container")
+    if len(fields) >= 2:
+        *secrets, comment = fields
+    else:
+        secrets, comment = fields, b""
+    priv_entry = pub_blob + b"".join(_ssh_string(f) for f in secrets)
+    return _openssh_key_v1_pem(pub_blob, priv_entry, comment), _decode_comment(comment)
+
+
 def convert_to_openssh_pem(pri_text: str) -> tuple[str, str]:
-    """Convenience wrapper: NSSSH private key text -> (PEM string, comment)."""
-    key = parse_nsssh_private_key(pri_text)
-    return key.to_pem_pkcs1(), key.comment
+    """NSSSH private key text -> (PEM string, comment).
+
+    ssh-rsa is emitted as PKCS#1; every other type (ed25519, ecdsa, dss, ...) goes
+    through the generic openssh-key-v1 path. Only unencrypted keys are supported.
+    """
+    pub, priv = _split_blocks(pri_text)
+    ktype, _ = _read_str(pub, 0)
+    if ktype == b"ssh-rsa":
+        key = parse_nsssh_private_key(pri_text)
+        return key.to_pem_pkcs1(), key.comment
+    return _generic_to_openssh(pub, priv)

@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from xts_utils.core.container import load_backup
+from xts_utils.core.container import Backup, Session, load_backup
 from xts_utils.sshconfig.exporter import export_backup
 from xts_utils.sshconfig.render import build_alias_map, host_alias, render_session
 
@@ -48,6 +48,29 @@ def test_export_backup_writes_tree(xts_path, tmp_path):
     assert result.keys_converted == 1
     assert result.sessions == 2
     assert "Include" in (out / "config").read_text()
+
+
+def test_unresolved_proxy_is_flagged_not_dropped(tmp_path):
+    s = Session(rel_dir="", name="srv", host="10.0.0.9", username="root",
+                proxy_name="Clash")  # proxy 'Clash' has no definition in the backup
+    b = Backup(sessions=[s], proxies={}, user_keys={}, host_keys=[])
+    amap = build_alias_map(b.sessions)
+
+    text = render_session(s, b, amap)
+    assert "Clash" in text and "set ProxyJump/ProxyCommand manually" in text
+
+    result = export_backup(b, str(tmp_path / "o"))
+    assert any("Clash" in w for w in result.warnings)
+
+
+def test_unconverted_key_is_flagged(tmp_path):
+    s = Session(rel_dir="", name="srv", host="10.0.0.9", username="root", user_key="ghost")
+    b = Backup(sessions=[s], proxies={}, user_keys={}, host_keys=[])
+    amap = build_alias_map(b.sessions)
+    # 'ghost' is referenced but absent from converted_keys -> IdentityFile flagged
+    text = render_session(s, b, amap, converted_keys=set())
+    assert "could not be converted" in text
+    assert "IdentityFile" in text
 
 
 def test_export_credentials_requires_master_password(xts_path, tmp_path):
