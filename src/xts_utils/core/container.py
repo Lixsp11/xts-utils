@@ -44,10 +44,28 @@ class Forward:
     description: str = ""
 
 
+# Xshell "Proxy > Type" enumeration, numbered in the order shown in its UI.
+PROXY_SOCKS4 = 0
+PROXY_SOCKS4A = 1
+PROXY_SOCKS5 = 2
+PROXY_HTTP = 3
+PROXY_SSH_PASSTHROUGH = 4
+PROXY_JUMPHOST = 5
+
+PROXY_TYPE_NAMES = {
+    PROXY_SOCKS4: "SOCKS4",
+    PROXY_SOCKS4A: "SOCKS4A",
+    PROXY_SOCKS5: "SOCKS5",
+    PROXY_HTTP: "HTTP",
+    PROXY_SSH_PASSTHROUGH: "SSH PASSTHROUGH",
+    PROXY_JUMPHOST: "JUMPHOST",
+}
+
+
 @dataclass
 class Proxy:
     name: str
-    type: int                 # 2=HTTP, 5=JUMPHOST (via a session), others=SOCKS family
+    type: int                 # one of the PROXY_* constants above
     host: str = ""
     port: str = ""
     username: str = ""
@@ -56,7 +74,11 @@ class Proxy:
 
     @property
     def is_jumphost(self) -> bool:
-        return self.type == 5 or (bool(self.session_ref) and not self.host)
+        return self.type == PROXY_JUMPHOST or (bool(self.session_ref) and not self.host)
+
+    @property
+    def type_name(self) -> str:
+        return PROXY_TYPE_NAMES.get(self.type, f"type {self.type}")
 
 
 @dataclass

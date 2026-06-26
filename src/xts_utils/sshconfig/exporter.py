@@ -18,7 +18,7 @@ from ..core.container import Backup
 from ..core.crypto import decrypt_password
 from ..core.hostkeys import known_hosts_line
 from ..core.rsakey import KeyConversionError, convert_to_openssh_pem
-from .render import build_alias_map, host_alias, quote_path, render_session
+from .render import build_alias_map, host_alias, proxy_uses_netcat, quote_path, render_session
 
 DEFAULT_HOME = "~/.ssh/xts"
 
@@ -140,10 +140,18 @@ def export_backup(backup: Backup, output_dir: str = DEFAULT_HOME, *,
     written_keys, warnings = install_keys(backup, key_dir_fs)
 
     converted = set(written_keys)
+    windows = os.name == "nt"
+    needs_netcat = False
     for s in backup.sessions:
-        if s.proxy_name and backup.proxy_for(s) is None:
+        p = backup.proxy_for(s)
+        if s.proxy_name and p is None:
             warnings.append(f"session '{s.name}' references proxy '{s.proxy_name}', which is not "
                             "in the backup; its proxy was omitted (set ProxyJump/ProxyCommand manually)")
+        elif p and not p.is_jumphost and not proxy_uses_netcat(p) and (p.host or p.session_ref):
+            warnings.append(f"session '{s.name}' uses proxy '{p.name}' ({p.type_name}), which has no "
+                            "OpenSSH equivalent; set ProxyJump/ProxyCommand manually")
+        if p and proxy_uses_netcat(p):
+            needs_netcat = True
 
     alias_map = build_alias_map(backup.sessions)
     conf_d = os.path.join(base_fs, "conf.d")
@@ -153,8 +161,14 @@ def export_backup(backup: Backup, output_dir: str = DEFAULT_HOME, *,
         depth = (rel.count("/") + 2) if rel else 1
         max_depth = max(max_depth, depth)
         block = render_session(s, backup, alias_map, key_dir=cfg_key_dir,
-                               identities_only=identities_only, converted_keys=converted)
+                               identities_only=identities_only, converted_keys=converted,
+                               windows=windows)
         _write(os.path.join(conf_d, rel, s.name + ".conf"), block)
+
+    if needs_netcat:
+        tool = "Nmap ncat (https://nmap.org/ncat/)" if windows else "OpenBSD netcat (the 'nc' command)"
+        warnings.append(f"some sessions use an HTTP/SOCKS proxy via ProxyCommand; install {tool} "
+                        "for those connections to work")
 
     # Top-level config: multi-depth glob Includes to cover arbitrary nesting.
     # Use the config base (forward slashes / portable '~') so paths work on

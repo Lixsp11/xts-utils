@@ -2,7 +2,14 @@ import os
 
 import pytest
 
-from xts_utils.core.container import Backup, Session, load_backup
+from xts_utils.core.container import (
+    PROXY_SOCKS5,
+    PROXY_SSH_PASSTHROUGH,
+    Backup,
+    Proxy,
+    Session,
+    load_backup,
+)
 from xts_utils.sshconfig.exporter import export_backup
 from xts_utils.sshconfig.render import build_alias_map, host_alias, render_session
 
@@ -61,6 +68,37 @@ def test_unresolved_proxy_is_flagged_not_dropped(tmp_path):
 
     result = export_backup(b, str(tmp_path / "o"))
     assert any("Clash" in w for w in result.warnings)
+
+
+def test_socks_proxy_command_per_platform(tmp_path):
+    s = Session(rel_dir="", name="srv", host="10.0.0.9", username="root", proxy_name="clash")
+    proxy = Proxy(name="clash", type=PROXY_SOCKS5, host="127.0.0.1", port="7890")
+    b = Backup(sessions=[s], proxies={"clash": proxy}, user_keys={}, host_keys=[])
+    amap = build_alias_map(b.sessions)
+
+    nix = render_session(s, b, amap, windows=False)
+    assert "ProxyCommand nc -X 5 -x 127.0.0.1:7890 %h %p" in nix
+    assert "# Windows (Nmap ncat): ProxyCommand ncat --proxy-type socks5" in nix
+
+    win = render_session(s, b, amap, windows=True)
+    assert "ProxyCommand ncat --proxy-type socks5 --proxy 127.0.0.1:7890 %h %p" in win
+    assert "# Linux/macOS (OpenBSD netcat): ProxyCommand nc -X 5" in win
+
+    result = export_backup(b, str(tmp_path / "o"))
+    assert any("netcat" in w or "ncat" in w for w in result.warnings)
+
+
+def test_unsupported_proxy_type_is_flagged(tmp_path):
+    s = Session(rel_dir="", name="srv", host="10.0.0.9", username="root", proxy_name="pt")
+    proxy = Proxy(name="pt", type=PROXY_SSH_PASSTHROUGH, host="10.0.0.1", port="22")
+    b = Backup(sessions=[s], proxies={"pt": proxy}, user_keys={}, host_keys=[])
+    amap = build_alias_map(b.sessions)
+
+    text = render_session(s, b, amap)
+    assert "SSH PASSTHROUGH" in text and "no OpenSSH equivalent" in text
+
+    result = export_backup(b, str(tmp_path / "o"))
+    assert any("SSH PASSTHROUGH" in w for w in result.warnings)
 
 
 def test_unconverted_key_is_flagged(tmp_path):

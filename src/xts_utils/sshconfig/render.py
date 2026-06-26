@@ -12,7 +12,17 @@ from __future__ import annotations
 import posixpath
 from collections import Counter
 
-from ..core.container import PARSE_FAILED_PREFIX, Backup, Forward, Proxy, Session
+from ..core.container import (
+    PARSE_FAILED_PREFIX,
+    PROXY_HTTP,
+    PROXY_SOCKS4,
+    PROXY_SOCKS4A,
+    PROXY_SOCKS5,
+    Backup,
+    Forward,
+    Proxy,
+    Session,
+)
 
 AliasMap = dict[tuple[str, str], str]
 
@@ -80,8 +90,36 @@ def _forward_line(f: Forward) -> str | None:
     return f"{keyword} {listen} {target}"
 
 
+# Xshell proxy TYPEs rendered as a ProxyCommand, with the matching netcat flags:
+#   OpenBSD netcat (nc) : -X {4|5|connect}
+#   Nmap ncat           : --proxy-type {socks4|socks5|http}
+# (nc/ncat have no separate SOCKS4A dialect, so SOCKS4A falls back to SOCKS4.)
+# JUMPHOST is handled separately (ProxyJump); SSH PASSTHROUGH and unknown types
+# have no OpenSSH equivalent and are emitted as a "set it manually" comment.
+_PROXY_COMMANDS = {
+    PROXY_SOCKS4: ("4", "socks4"),
+    PROXY_SOCKS4A: ("4", "socks4"),
+    PROXY_SOCKS5: ("5", "socks5"),
+    PROXY_HTTP: ("connect", "http"),
+}
+
+
+def proxy_uses_netcat(proxy: Proxy) -> bool:
+    """True when the proxy renders to a netcat-based ProxyCommand (needs nc/ncat)."""
+    return (not proxy.is_jumphost and proxy.type in _PROXY_COMMANDS
+            and bool(proxy.host and proxy.port))
+
+
+def _nc_command(proxy: Proxy, nc_flag: str) -> str:
+    return f"ProxyCommand nc -X {nc_flag} -x {proxy.host}:{proxy.port} %h %p"
+
+
+def _ncat_command(proxy: Proxy, ncat_type: str) -> str:
+    return f"ProxyCommand ncat --proxy-type {ncat_type} --proxy {proxy.host}:{proxy.port} %h %p"
+
+
 def _proxy_lines(session: Session, proxy: Proxy, backup: Backup,
-                 alias_map: AliasMap) -> list[str]:
+                 alias_map: AliasMap, *, windows: bool = False) -> list[str]:
     """Generate proxy-related config lines (possibly multiple lines + comments)."""
     lines: list[str] = []
     if proxy.is_jumphost:
@@ -92,16 +130,23 @@ def _proxy_lines(session: Session, proxy: Proxy, backup: Backup,
         else:
             lines.append(f"# Jump-host proxy '{proxy.name}' could not be resolved to a "
                          "known session; please set ProxyJump manually")
-    elif proxy.host and proxy.port:
-        # HTTP / SOCKS proxy -> ProxyCommand (requires nc / ncat on the system)
-        if proxy.type == 2:
-            ptype, flag = "HTTP", "-X connect"
-        elif proxy.type in (0, 1):
-            ptype, flag = "SOCKS4", "-X 4"
+    elif proxy.type in _PROXY_COMMANDS and proxy.host and proxy.port:
+        # HTTP / SOCKS proxy -> ProxyCommand. Emit the variant for the host OS and
+        # keep the other as a comment so the tree stays usable on either platform.
+        nc_flag, ncat_type = _PROXY_COMMANDS[proxy.type]
+        nc_cmd = _nc_command(proxy, nc_flag)
+        ncat_cmd = _ncat_command(proxy, ncat_type)
+        lines.append(f"# Via {proxy.type_name} proxy {proxy.host}:{proxy.port}")
+        if windows:
+            lines.append(ncat_cmd)
+            lines.append(f"# Linux/macOS (OpenBSD netcat): {nc_cmd}")
         else:
-            ptype, flag = "SOCKS5", "-X 5"
-        lines.append(f"# Via {ptype} proxy {proxy.host}:{proxy.port} (requires OpenBSD netcat)")
-        lines.append(f"ProxyCommand nc {flag} -x {proxy.host}:{proxy.port} %h %p")
+            lines.append(nc_cmd)
+            lines.append(f"# Windows (Nmap ncat): {ncat_cmd}")
+    elif proxy.host or proxy.session_ref:
+        # e.g. SSH PASSTHROUGH -- no OpenSSH equivalent we can emit safely.
+        lines.append(f"# Proxy '{proxy.name}' ({proxy.type_name}) has no OpenSSH equivalent; "
+                     "set ProxyJump/ProxyCommand manually")
     return lines
 
 
@@ -130,7 +175,8 @@ def _resolve_jump_alias(proxy: Proxy, backup: Backup, alias_map: AliasMap) -> st
 def render_session(session: Session, backup: Backup, alias_map: AliasMap, *,
                    key_dir: str = "~/.ssh/xts/keys",
                    identities_only: bool = True,
-                   converted_keys: set[str] | None = None) -> str:
+                   converted_keys: set[str] | None = None,
+                   windows: bool = False) -> str:
     """Render a single session as one Host block."""
     lines: list[str] = []
     alias = host_alias(session, alias_map)
@@ -150,7 +196,7 @@ def render_session(session: Session, backup: Backup, alias_map: AliasMap, *,
     if session.uses_pubkey and session.user_key:
         keypath = posixpath.join(key_dir, session.user_key)
         if converted_keys is not None and session.user_key not in converted_keys:
-            lines.append(f"    # WARNING: key '{session.user_key}' could not be converted "
+            lines.append(f"    # Key '{session.user_key}' could not be converted "
                          "(unsupported/encrypted); this IdentityFile will not work until you replace it")
         lines.append(f"    IdentityFile {quote_path(keypath)}")
         if identities_only:
@@ -158,7 +204,7 @@ def render_session(session: Session, backup: Backup, alias_map: AliasMap, *,
 
     proxy = backup.proxy_for(session)
     if proxy:
-        for pl in _proxy_lines(session, proxy, backup, alias_map):
+        for pl in _proxy_lines(session, proxy, backup, alias_map, windows=windows):
             lines.append(f"    {pl}")
     elif session.proxy_name:
         lines.append(f"    # Proxy '{session.proxy_name}' is not included in this backup; "
