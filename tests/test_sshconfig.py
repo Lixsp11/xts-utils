@@ -111,6 +111,31 @@ def test_unconverted_key_is_flagged(tmp_path):
     assert "IdentityFile" in text
 
 
+def test_export_template_is_copied_and_included_first(xts_path, tmp_path):
+    b = load_backup(xts_path)
+    out = tmp_path / "out"
+    tmpl = "Host *\n    ServerAliveInterval 120\n    Port 22000\n"
+    result = export_backup(b, str(out), template_text=tmpl)
+
+    # copied verbatim to template.conf
+    assert result.template_path == str(out / "template.conf")
+    assert (out / "template.conf").read_text() == tmpl
+
+    # config Includes it before conf.d (first-match-wins -> template overrides hosts)
+    config = (out / "config").read_text()
+    tmpl_inc = config.index("template.conf")
+    conf_d_inc = config.index("conf.d")
+    assert tmpl_inc < conf_d_inc
+
+
+def test_export_without_template_writes_no_template_file(xts_path, tmp_path):
+    b = load_backup(xts_path)
+    out = tmp_path / "out"
+    result = export_backup(b, str(out))
+    assert result.template_path is None
+    assert not (out / "template.conf").exists()
+
+
 def test_export_credentials_requires_master_password(xts_path, tmp_path):
     b = load_backup(xts_path)
     with pytest.raises(ValueError):

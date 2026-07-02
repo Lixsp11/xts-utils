@@ -44,6 +44,29 @@ xts-utils export sshconfig backup.xts --dump-credentials --master-password '<pw>
 # writes <base>/credentials.txt (mode 0600) -- keep safe, never commit
 ```
 
+## Shared config template
+
+Apply your own options to every host with `--template`. The file (a plain
+`ssh_config` snippet, usually a `Host *` block) is copied in and Included
+**first**, so by ssh's first-match-wins rule its options **override** each host's
+settings and any new keywords are **added** to all of them.
+
+```sshconfig
+# template.conf -- disable X11 forwarding, keep idle connections alive
+Host *
+    ForwardX11 no
+    ServerAliveInterval 30
+```
+
+```bash
+xts-utils export sshconfig backup.xts --template template.conf
+# -> <base>/template.conf, Included before conf.d/ in <base>/config
+```
+
+Here `ForwardX11 no` overrides any per-host `ForwardX11 yes`, and
+`ServerAliveInterval 30` (sent every 30s to stop the server dropping an idle
+connection) is added to every host.
+
 ## Key types
 
 Private keys are converted to a format OpenSSH reads directly: RSA → PKCS#1 PEM,

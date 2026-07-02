@@ -38,18 +38,30 @@ def _cmd_export_sshconfig(args: argparse.Namespace) -> int:
         print("error: --dump-credentials requires --master-password", file=sys.stderr)
         return 2
 
+    template_text = None
+    if args.template:
+        try:
+            with open(args.template, encoding="utf-8") as f:
+                template_text = f.read()
+        except OSError as exc:
+            print(f"error: cannot read template {args.template}: {exc}", file=sys.stderr)
+            return 2
+
     backup = load_backup(args.xts_path)
     result = export_backup(
         backup, args.output,
         identities_only=not args.no_identities_only,
         dump_credentials=args.dump_credentials,
         master_password=args.master_password,
+        template_text=template_text,
     )
 
     print(f"OK  parsed {result.sessions} sessions in {result.groups} groups")
     print(f"OK  converted {result.keys_converted}/{result.keys_total} private keys "
           f"-> {result.key_dir_filesystem}")
     print(f"OK  ssh config -> {result.config_path}  (conf.d/ mirrors the Xshell tree)")
+    if result.template_path:
+        print(f"OK  template -> {result.template_path}  (Included first; overrides every host)")
     if result.known_hosts_path:
         print(f"OK  known_hosts -> {result.known_hosts_path}")
     if result.credentials_path:
@@ -83,6 +95,9 @@ def build_parser() -> argparse.ArgumentParser:
              "config, conf.d/, keys/ and known_hosts are written under it.")
     p_ssh.add_argument("--no-identities-only", action="store_true",
                        help="do not emit 'IdentitiesOnly yes'")
+    p_ssh.add_argument("--template", default=None, metavar="FILE",
+                       help="ssh_config snippet (e.g. a 'Host *' block) copied in and Included "
+                            "first, so its options override every host")
     p_ssh.add_argument("--dump-credentials", action="store_true",
                        help="also export plaintext passwords/passphrases (needs --master-password)")
     p_ssh.add_argument("--master-password", default=None,
