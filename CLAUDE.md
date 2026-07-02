@@ -30,7 +30,7 @@ The library is **xts-centric**: there is intentionally **no intermediate/neutral
 - **`core/`** — everything about the `.xts` format.
   - `container.py` — `load_backup(path) -> Backup`. Reads the ZIP, parses sessions (`Xshell/<group>/<name>.xsh`), proxies (`com/Common/Proxy/*.ini`), user keys (`com/SECSH/UserKeys/*.pri`), host keys (`com/SECSH/HostKeys/*.pub`). `Backup` is the in-memory `.xts`; converters read from it. A failed session becomes a placeholder host (`PARSE_FAILED_PREFIX`) rather than aborting the run.
   - `crypto.py` — RC4 + version-dependent key derivation. For Xshell >5.2 with a master password, the key is `SHA256(master_password)` — fully offline, no SID/machine binding. `encrypt_password` is the inverse, kept for the future import direction.
-  - `rsakey.py` — converts NetSarang `nsssh-key-v6` private keys to PKCS#1 PEM (hand-rolled DER, recomputes `iqmp` rather than trusting the stored value).
+  - `rsakey.py` — converts NetSarang `nsssh-key-v6` private keys to a key OpenSSH accepts. Two paths (`convert_to_openssh_pem`): **RSA → PKCS#1 PEM** (hand-rolled DER, recomputes `iqmp = q⁻¹ mod p` rather than trusting the stored value); **everything else (Ed25519, ecdsa, dss) → `openssh-key-v1` PEM** via `_generic_to_openssh` (Ed25519 validated against a real sample; ecdsa/dss are best-effort, no sample). `_split_blocks` locates the private container by scanning 4-byte-aligned offsets for the `nsssh-key-v6` magic — it does **not** split on `=` padding (an Ed25519 51-byte public block has none).
   - `hostkeys.py` — RFC4716 public key → `known_hosts` line.
 - **`sshconfig/`** — the `.xts` ↔ `ssh_config` converter (export today; `importer` is the planned reverse).
   - `render.py` — pure, no-I/O rendering of one `Session` into a `Host` block.
@@ -39,6 +39,7 @@ The library is **xts-centric**: there is intentionally **no intermediate/neutral
 
 ## Conventions and non-obvious constraints
 
+- **Xshell files are UTF-16.** `.xsh`/`.ini` payloads decode via `_decode` (tries `utf-16` among others), but if you `grep`/scan raw bytes for content, use `utf-16-le` or you will silently miss matches.
 - **ssh aliases must be slash-free.** OpenSSH rejects `/` in `ProxyJump` targets, so `build_alias_map` produces slash-free aliases (group-prefixed on collision) and jump hosts reference the bare alias. Don't put `/` into a Host alias.
 - **Windows-safe paths.** Anything written *into* config files (`Include`, `IdentityFile`) uses forward slashes and is quoted when it contains spaces (`quote_path`). A leading `~` is kept verbatim (portable); otherwise the path is made absolute (a relative `Include` would resolve against `~/.ssh`, not the base dir). See `_config_base`.
 - **Output location** is controlled only by `-o` (default `~/.ssh/xts`). There is no environment variable — do not add one.
